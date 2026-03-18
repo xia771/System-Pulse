@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>系统脉搏</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;700&family=Space+Grotesk:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="hero card reveal">
+        <div>
+          <p class="eyebrow">实时遥测看板</p>
+          <h1>系统脉搏</h1>
+          <p class="subtitle">实时追踪这台电脑的 CPU 与内存占用。</p>
+        </div>
+        <div class="status-pill" aria-live="polite">
+          <span id="status-dot" class="status-dot is-pending"></span>
+          <span id="status-text">连接中</span>
+        </div>
+      </header>
+
+      <main>
+        <section class="metrics-grid">
+          <article id="cpu-card" class="metric-card card reveal">
+            <p class="metric-label">CPU 使用率</p>
+            <p id="cpu-value" class="metric-value">--%</p>
+            <div class="meter" aria-hidden="true"><span id="cpu-meter"></span></div>
+          </article>
+
+          <article id="memory-card" class="metric-card card reveal">
+            <p class="metric-label">内存使用率</p>
+            <p id="memory-value" class="metric-value">--%</p>
+            <div class="meter" aria-hidden="true"><span id="memory-meter"></span></div>
+          </article>
+
+          <article class="metric-card card reveal">
+            <p class="metric-label">内存占用</p>
+            <p id="memory-footprint" class="metric-value">-- / -- GB</p>
+            <p class="metric-note">
+              最近更新：<span id="last-update">--:--:--</span>
+            </p>
+          </article>
+        </section>
+
+        <section class="controls-grid">
+          <article class="control-card card reveal">
+            <h2>告警中心</h2>
+            <div class="alert-controls">
+              <div class="control-row">
+                <label for="cpu-alert-threshold">CPU 告警阈值</label>
+                <input id="cpu-alert-threshold" type="number" min="1" max="100" value="85" />
+              </div>
+              <div class="control-row">
+                <label for="memory-alert-threshold">内存告警阈值</label>
+                <input id="memory-alert-threshold" type="number" min="1" max="100" value="85" />
+              </div>
+            </div>
+            <div class="toggle-row">
+              <label class="switch" for="sound-enabled">
+                <input id="sound-enabled" type="checkbox" checked />
+                声音告警
+              </label>
+              <label class="switch" for="browser-notify-enabled">
+                <input id="browser-notify-enabled" type="checkbox" />
+                浏览器通知
+              </label>
+              <button id="enable-notification" type="button">开启通知权限</button>
+            </div>
+            <p id="alert-log" class="alert-log">暂无告警触发。</p>
+          </article>
+        </section>
+
+        <section class="history-grid">
+          <article class="history-card card reveal">
+            <h2>历史记录与导出</h2>
+            <div class="history-controls">
+              <label for="history-range">时间范围</label>
+              <select id="history-range">
+                <option value="5">最近 5 分钟</option>
+                <option value="15">最近 15 分钟</option>
+                <option value="30" selected>最近 30 分钟</option>
+                <option value="60">最近 60 分钟</option>
+                <option value="180">最近 3 小时</option>
+              </select>
+              <button id="refresh-history" type="button">刷新统计</button>
+              <a id="export-history" href="/api/history/export?minutes=30" download>导出 CSV</a>
+            </div>
+            <p id="history-summary" class="history-summary">正在加载历史统计...</p>
+          </article>
+
+          <article class="history-card card reveal">
+            <h2>告警历史</h2>
+            <ul id="alert-history-list" class="alert-history-list">
+              <li class="is-placeholder">暂无告警记录。</li>
+            </ul>
+          </article>
+        </section>
+
+        <section class="charts-grid">
+          <article class="chart-card card reveal">
+            <h2>CPU 趋势（60秒）</h2>
+            <div id="cpu-chart" class="chart"></div>
+          </article>
+
+          <article class="chart-card card reveal">
+            <h2>内存趋势（60秒）</h2>
+            <div id="memory-chart" class="chart"></div>
+          </article>
+        </section>
+
+        <section class="process-grid">
+          <article class="process-card card reveal">
+            <h2>CPU 占用 Top5 进程</h2>
+            <table class="process-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>进程</th>
+                  <th>CPU</th>
+                  <th>内存</th>
+                </tr>
+              </thead>
+              <tbody id="cpu-process-body">
+                <tr class="is-placeholder">
+                  <td colspan="4">等待进程指标...</td>
+                </tr>
+              </tbody>
+            </table>
+          </article>
+
+          <article class="process-card card reveal">
+            <h2>内存占用 Top5 进程</h2>
+            <table class="process-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>进程</th>
+                  <th>内存</th>
+                  <th>RSS</th>
+                </tr>
+              </thead>
+              <tbody id="memory-process-body">
+                <tr class="is-placeholder">
+                  <td colspan="4">等待进程指标...</td>
+                </tr>
+              </tbody>
+            </table>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js"></script>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
