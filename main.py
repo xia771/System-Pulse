@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import logging
 import sqlite3
 import time
 from collections.abc import Mapping
@@ -22,7 +23,11 @@ IDLE_PROCESS_NAMES = {"System Idle Process", "Idle"}
 HISTORY_RETENTION_HOURS = 24
 HISTORY_PRUNE_INTERVAL = 120
 DEFAULT_HISTORY_MINUTES = 30
-MAX_HISTORY_LIMIT = 10000
+MAX_HISTORY_JSON_LIMIT = 10000
+MAX_HISTORY_EXPORT_LIMIT = 120000
+DEFAULT_HISTORY_EXPORT_LIMIT = MAX_HISTORY_EXPORT_LIMIT
+SAMPLER_BACKOFF_SECONDS = 2.0
+DB_TIMEOUT_SECONDS = 10
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -35,6 +40,7 @@ MetricsPayload = dict[str, MetricScalar | list[ProcessRow]]
 latest_metrics: MetricsPayload | None = None
 history_write_count = 0
 sampler_task: asyncio.Task[None] | None = None
+logger = logging.getLogger("system-pulse")
 
 
 def to_int(value: object, fallback: int = 0) -> int:
@@ -63,8 +69,16 @@ def to_float(value: object, fallback: float = 0.0) -> float:
     return fallback
 
 
+def open_db() -> sqlite3.Connection:
+    connection = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_SECONDS)
+    connection.execute("PRAGMA busy_timeout = 5000")
+    return connection
+
+
 def init_history_db() -> None:
-    with sqlite3.connect(DB_PATH) as connection:
+    with open_db() as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS metrics_history (
@@ -92,7 +106,7 @@ def store_metrics_history(metrics: Mapping[str, object]) -> None:
     should_prune = history_write_count % HISTORY_PRUNE_INTERVAL == 0
     cutoff_ts = int(time.time()) - HISTORY_RETENTION_HOURS * 3600
 
-    with sqlite3.connect(DB_PATH) as connection:
+    with open_db() as connection:
         connection.execute(
             """
             INSERT INTO metrics_history (ts, cpu_percent, mem_percent, mem_used_gb, mem_total_gb)
@@ -115,7 +129,7 @@ def store_metrics_history(metrics: Mapping[str, object]) -> None:
 
 def fetch_history_rows(minutes: int, limit: int) -> list[dict[str, float | int]]:
     since_ts = int(time.time()) - minutes * 60
-    with sqlite3.connect(DB_PATH) as connection:
+    with open_db() as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
@@ -140,6 +154,39 @@ def fetch_history_rows(minutes: int, limit: int) -> list[dict[str, float | int]]
     ]
     items_desc.reverse()
     return items_desc
+
+
+def fetch_history_stats(minutes: int) -> dict[str, float | int | None]:
+    since_ts = int(time.time()) - minutes * 60
+    with open_db() as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """
+            SELECT
+                COUNT(*) AS sample_count,
+                AVG(cpu_percent) AS cpu_avg,
+                MAX(cpu_percent) AS cpu_max,
+                AVG(mem_percent) AS mem_avg,
+                MAX(mem_percent) AS mem_max,
+                MIN(ts) AS earliest_ts,
+                MAX(ts) AS latest_ts
+            FROM metrics_history
+            WHERE ts >= ?
+            """,
+            (since_ts,),
+        ).fetchone()
+
+    sample_count = int(row["sample_count"] or 0) if row is not None else 0
+    return {
+        "minutes": minutes,
+        "sample_count": sample_count,
+        "cpu_avg": round(float(row["cpu_avg"] or 0.0), 2) if row is not None else 0.0,
+        "cpu_max": round(float(row["cpu_max"] or 0.0), 2) if row is not None else 0.0,
+        "mem_avg": round(float(row["mem_avg"] or 0.0), 2) if row is not None else 0.0,
+        "mem_max": round(float(row["mem_max"] or 0.0), 2) if row is not None else 0.0,
+        "earliest_ts": int(row["earliest_ts"]) if row is not None and row["earliest_ts"] else None,
+        "latest_ts": int(row["latest_ts"]) if row is not None and row["latest_ts"] else None,
+    }
 
 
 def history_rows_to_csv(rows: list[dict[str, float | int]]) -> str:
@@ -222,11 +269,21 @@ def collect_metrics() -> MetricsPayload:
 
 async def metrics_sampler() -> None:
     global latest_metrics
+
     while True:
-        metrics = collect_metrics()
-        latest_metrics = metrics
-        store_metrics_history(metrics)
-        await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
+        started_at = time.perf_counter()
+        try:
+            metrics = collect_metrics()
+            latest_metrics = metrics
+            store_metrics_history(metrics)
+        except Exception:
+            logger.exception("Metrics sampler iteration failed")
+            await asyncio.sleep(SAMPLER_BACKOFF_SECONDS)
+            continue
+
+        elapsed = time.perf_counter() - started_at
+        sleep_for = max(REFRESH_INTERVAL_SECONDS - elapsed, 0.05)
+        await asyncio.sleep(sleep_for)
 
 
 @asynccontextmanager
@@ -268,10 +325,27 @@ async def metrics_snapshot() -> MetricsPayload:
     return latest_metrics
 
 
+@app.get("/api/health")
+async def health_status() -> dict[str, bool | str]:
+    sampler_running = sampler_task is not None and not sampler_task.done()
+    return {
+        "status": "ok",
+        "sampler_running": sampler_running,
+        "has_latest_metrics": latest_metrics is not None,
+    }
+
+
+@app.get("/api/history/stats")
+async def metrics_history_stats(
+    minutes: int = Query(DEFAULT_HISTORY_MINUTES, ge=1, le=HISTORY_RETENTION_HOURS * 60),
+) -> dict[str, float | int | None]:
+    return fetch_history_stats(minutes)
+
+
 @app.get("/api/history")
 async def metrics_history(
     minutes: int = Query(DEFAULT_HISTORY_MINUTES, ge=1, le=HISTORY_RETENTION_HOURS * 60),
-    limit: int = Query(3600, ge=60, le=MAX_HISTORY_LIMIT),
+    limit: int = Query(3600, ge=60, le=MAX_HISTORY_JSON_LIMIT),
 ) -> dict[str, int | list[dict[str, float | int]]]:
     items = fetch_history_rows(minutes=minutes, limit=limit)
     return {
@@ -284,7 +358,7 @@ async def metrics_history(
 @app.get("/api/history/export")
 async def metrics_history_export(
     minutes: int = Query(DEFAULT_HISTORY_MINUTES, ge=1, le=HISTORY_RETENTION_HOURS * 60),
-    limit: int = Query(3600, ge=60, le=MAX_HISTORY_LIMIT),
+    limit: int = Query(DEFAULT_HISTORY_EXPORT_LIMIT, ge=60, le=MAX_HISTORY_EXPORT_LIMIT),
 ) -> PlainTextResponse:
     items = fetch_history_rows(minutes=minutes, limit=limit)
     payload = history_rows_to_csv(items)
@@ -299,10 +373,16 @@ async def metrics_history_export(
 @app.websocket("/ws/metrics")
 async def metrics_stream(websocket: WebSocket) -> None:
     await websocket.accept()
+    last_sent_ts = -1
+
     try:
         while True:
             payload = latest_metrics if latest_metrics is not None else collect_metrics()
-            await websocket.send_json(payload)
-            await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
+            payload_ts = to_int(payload.get("ts"), 0)
+            if payload_ts != last_sent_ts:
+                await websocket.send_json(payload)
+                last_sent_ts = payload_ts
+
+            await asyncio.sleep(0.2)
     except WebSocketDisconnect:
         return

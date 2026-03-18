@@ -9,6 +9,7 @@ const ALERT_HISTORY_STORAGE_KEY = "system-pulse.alert-history";
 const MAX_ALERT_HISTORY_ITEMS = 30;
 const DEFAULT_HISTORY_MINUTES = 30;
 const MAX_HISTORY_RANGE_MINUTES = 24 * 60;
+const HISTORY_SUMMARY_REFRESH_MS = 30000;
 
 const statusDot = document.getElementById("status-dot");
 const statusText = document.getElementById("status-text");
@@ -202,29 +203,28 @@ function updateHistoryExportLink(minutes) {
   exportHistoryLink.href = `/api/history/export?minutes=${minutes}`;
 }
 
-function summarizeHistory(items, minutes) {
-  if (!Array.isArray(items) || items.length === 0) {
+function formatTimeLabel(unixSeconds) {
+  const value = toFiniteNumber(unixSeconds);
+  if (!value) {
+    return "--:--:--";
+  }
+  return new Date(value * 1000).toLocaleTimeString();
+}
+
+function summarizeHistoryStats(payload, minutes) {
+  const sampleCount = toFiniteNumber(payload.sample_count, 0);
+  if (sampleCount <= 0) {
     return `最近 ${minutes} 分钟暂无历史样本。`;
   }
 
-  let cpuTotal = 0;
-  let memTotal = 0;
-  let cpuPeak = 0;
-  let memPeak = 0;
+  const cpuAvg = toFiniteNumber(payload.cpu_avg);
+  const cpuMax = toFiniteNumber(payload.cpu_max);
+  const memAvg = toFiniteNumber(payload.mem_avg);
+  const memMax = toFiniteNumber(payload.mem_max);
+  const earliest = formatTimeLabel(payload.earliest_ts);
+  const latest = formatTimeLabel(payload.latest_ts);
 
-  items.forEach((item) => {
-    const cpu = toFiniteNumber(item.cpu_percent);
-    const mem = toFiniteNumber(item.mem_percent);
-    cpuTotal += cpu;
-    memTotal += mem;
-    cpuPeak = Math.max(cpuPeak, cpu);
-    memPeak = Math.max(memPeak, mem);
-  });
-
-  const cpuAvg = cpuTotal / items.length;
-  const memAvg = memTotal / items.length;
-
-  return `最近 ${minutes} 分钟样本 ${items.length} 条；CPU 均值 ${cpuAvg.toFixed(1)}% / 峰值 ${cpuPeak.toFixed(1)}%；内存均值 ${memAvg.toFixed(1)}% / 峰值 ${memPeak.toFixed(1)}%。`;
+  return `最近 ${minutes} 分钟样本 ${sampleCount} 条（${earliest} - ${latest}）；CPU 均值 ${cpuAvg.toFixed(1)}% / 峰值 ${cpuMax.toFixed(1)}%；内存均值 ${memAvg.toFixed(1)}% / 峰值 ${memMax.toFixed(1)}%。`;
 }
 
 async function loadHistorySummary(minutes) {
@@ -232,14 +232,14 @@ async function loadHistorySummary(minutes) {
   historySummary.textContent = "正在加载历史统计...";
 
   try {
-    const response = await fetch(`/api/history?minutes=${minutes}&limit=3600`);
+    const response = await fetch(`/api/history/stats?minutes=${minutes}`);
     if (!response.ok) {
       historySummary.textContent = "历史统计加载失败，请稍后重试。";
       return;
     }
 
     const payload = await response.json();
-    historySummary.textContent = summarizeHistory(payload.items, minutes);
+    historySummary.textContent = summarizeHistoryStats(payload, minutes);
   } catch {
     historySummary.textContent = "历史统计加载失败，请稍后重试。";
   }
@@ -250,23 +250,35 @@ function initializeHistoryControls() {
   alertHistory.splice(0, alertHistory.length, ...savedAlertHistory);
   renderAlertHistory();
 
-  const initialMinutes = parseMinutesRange(historyRange.value, DEFAULT_HISTORY_MINUTES);
-  historyRange.value = String(initialMinutes);
-  updateHistoryExportLink(initialMinutes);
+  let currentMinutes = parseMinutesRange(historyRange.value, DEFAULT_HISTORY_MINUTES);
+  historyRange.value = String(currentMinutes);
+  updateHistoryExportLink(currentMinutes);
 
   historyRange.addEventListener("change", () => {
-    const minutes = parseMinutesRange(historyRange.value, DEFAULT_HISTORY_MINUTES);
-    historyRange.value = String(minutes);
-    loadHistorySummary(minutes);
+    currentMinutes = parseMinutesRange(historyRange.value, DEFAULT_HISTORY_MINUTES);
+    historyRange.value = String(currentMinutes);
+    loadHistorySummary(currentMinutes);
   });
 
   refreshHistoryButton.addEventListener("click", () => {
-    const minutes = parseMinutesRange(historyRange.value, DEFAULT_HISTORY_MINUTES);
-    historyRange.value = String(minutes);
-    loadHistorySummary(minutes);
+    currentMinutes = parseMinutesRange(historyRange.value, DEFAULT_HISTORY_MINUTES);
+    historyRange.value = String(currentMinutes);
+    loadHistorySummary(currentMinutes);
   });
 
-  loadHistorySummary(initialMinutes);
+  window.setInterval(() => {
+    if (document.visibilityState === "visible") {
+      loadHistorySummary(currentMinutes);
+    }
+  }, HISTORY_SUMMARY_REFRESH_MS);
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      loadHistorySummary(currentMinutes);
+    }
+  });
+
+  loadHistorySummary(currentMinutes);
 }
 
 function getLineChartOption(seriesName, lineColor) {
